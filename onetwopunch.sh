@@ -1,4 +1,4 @@
-#!/bin/bash 
+#!/bin/bash
 
 # Colors
 ESC="\e["
@@ -19,14 +19,14 @@ echo ""
 }
 
 function usage {
-    echo "Usage: $0 -t targets.txt [-p tcp/udp/all] [-i interface] [-n nmap-options] [-h]"
+    echo "Usage: $0 -t targets.txt [-p tcp/udp/all] [-i interface] [-r rate] [-n nmap-options] [-h]"
     echo "       -h: Help"
-    echo "       -t: File containing ip addresses to scan. This option is required."
-    echo "       -p: Protocol. Defaults to tcp"
+    echo "       -t: File containing IP addresses to scan. Required."
+    echo "       -p: Protocol. Defaults to tcp (tcp/udp/all)"
     echo "       -i: Network interface. Defaults to eth0"
-    echo "       -n: NMAP options (-A, -O, etc). Defaults to no options."
+    echo "       -r: Unicornscan packets-per-second rate. Defaults to 1000"
+    echo "       -n: Nmap options (-A, -O, etc). Defaults to -sV"
 }
-
 
 banner
 
@@ -36,30 +36,39 @@ if [[ ! $(id -u) == 0 ]]; then
 fi
 
 if [[ -z $(which nmap) ]]; then
-    echo -e "${RED}[!]${RESET} Unable to find nmap. Install it and make sure it's in your PATH   environment"
+    echo -e "${RED}[!]${RESET} Unable to find nmap. Install it and make sure it's in your PATH environment"
     exit 1
 fi
 
-if [[ -z $(which unicornscan) ]]; then
-    echo -e "${RED}[!]${RESET} Unable to find unicornscan. Install it and make sure it's in your PATH environment"
+# Support both 'unicornscan' and 'us' binary names
+UNICORNSCAN_BIN=""
+if [[ -n $(which unicornscan 2>/dev/null) ]]; then
+    UNICORNSCAN_BIN=$(which unicornscan)
+elif [[ -n $(which us 2>/dev/null) ]]; then
+    UNICORNSCAN_BIN=$(which us)
+else
+    echo -e "${RED}[!]${RESET} Unable to find unicornscan or us. Install it and make sure it's in your PATH environment"
     exit 1
 fi
+
+echo -e "${BLUE}[+]${RESET} Using unicornscan binary: ${UNICORNSCAN_BIN}"
 
 if [[ -z $1 ]]; then
     usage
     exit 0
 fi
 
-# commonly used default options
 proto="tcp"
 iface="eth0"
+rate="1000"
 nmap_opt="-sV"
 targets=""
 
-while getopts "p:i:t:n:h" OPT; do
+while getopts "p:i:r:t:n:h" OPT; do
     case $OPT in
         p) proto=${OPTARG};;
         i) iface=${OPTARG};;
+        r) rate=${OPTARG};;
         t) targets=${OPTARG};;
         n) nmap_opt=${OPTARG};;
         h) usage; exit 0;;
@@ -67,13 +76,18 @@ while getopts "p:i:t:n:h" OPT; do
     esac
 done
 
-if [[ -z $targets ]]; then
+if [[ -z "${targets}" ]]; then
     echo "[!] No target file provided"
     usage
     exit 1
 fi
 
-if [[ ${proto} != "tcp" && ${proto} != "udp" && ${proto} != "all" ]]; then
+if [[ ! -f "${targets}" ]]; then
+    echo -e "${RED}[!]${RESET} Target file not found: ${targets}"
+    exit 1
+fi
+
+if [[ "${proto}" != "tcp" && "${proto}" != "udp" && "${proto}" != "all" ]]; then
     echo "[!] Unsupported protocol"
     usage
     exit 1
@@ -81,61 +95,80 @@ fi
 
 echo -e "${BLUE}[+]${RESET} Protocol : ${proto}"
 echo -e "${BLUE}[+]${RESET} Interface: ${iface}"
+echo -e "${BLUE}[+]${RESET} Rate     : ${rate} pps"
 echo -e "${BLUE}[+]${RESET} Nmap opts: ${nmap_opt}"
 echo -e "${BLUE}[+]${RESET} Targets  : ${targets}"
 
-# backup any old scans before we start a new one
+# Backup any old scans before starting a new one
 log_dir="${HOME}/.onetwopunch"
 mkdir -p "${log_dir}/backup/"
-if [[ -d "${log_dir}/ndir/" ]]; then 
+if [[ -d "${log_dir}/ndir/" ]]; then
     mv "${log_dir}/ndir/" "${log_dir}/backup/ndir-$(date "+%Y%m%d-%H%M%S")/"
 fi
-if [[ -d "${log_dir}/udir/" ]]; then 
+if [[ -d "${log_dir}/udir/" ]]; then
     mv "${log_dir}/udir/" "${log_dir}/backup/udir-$(date "+%Y%m%d-%H%M%S")/"
-fi 
+fi
 
 rm -rf "${log_dir}/ndir/"
 mkdir -p "${log_dir}/ndir/"
 rm -rf "${log_dir}/udir/"
 mkdir -p "${log_dir}/udir/"
 
-while read ip; do
-    log_ip=$(echo ${ip} | sed 's/\//-/g')
-    echo -e "${BLUE}[+]${RESET} Scanning $ip for $proto ports..."
+while read -r ip; do
+    # Skip blank lines and comments
+    [[ -z "${ip}" || "${ip}" == \#* ]] && continue
+
+    log_ip=$(echo "${ip}" | sed 's/\//-/g')
+    echo -e "${BLUE}[+]${RESET} Scanning ${ip} for ${proto} ports..."
 
     # unicornscan identifies all open TCP ports
-    if [[ $proto == "tcp" || $proto == "all" ]]; then 
+    # New unicornscan: no -l flag; capture stdout via tee
+    # -I = immediate output; -r = rate; 1-65535 replaces legacy :a shorthand
+    if [[ "${proto}" == "tcp" || "${proto}" == "all" ]]; then
         echo -e "${BLUE}[+]${RESET} Obtaining all open TCP ports using unicornscan..."
-        echo -e "${BLUE}[+]${RESET} unicornscan -i ${iface} -mT ${ip}:a -l ${log_dir}/udir/${log_ip}-tcp.txt"
-        unicornscan -i ${iface} -mT ${ip}:a -l ${log_dir}/udir/${log_ip}-tcp.txt
-        ports=$(cat "${log_dir}/udir/${log_ip}-tcp.txt" | grep open | cut -d"[" -f2 | cut -d"]" -f1 | sed 's/ //g' | tr '\n' ',')
-        if [[ ! -z $ports ]]; then 
-            # nmap follows up
-            echo -e "${GREEN}[*]${RESET} TCP ports for nmap to scan: $ports"
-            echo -e "${BLUE}[+]${RESET} nmap -e ${iface} ${nmap_opt} -oX ${log_dir}/ndir/${log_ip}-tcp.xml -oG ${log_dir}/ndir/${log_ip}-tcp.grep -p ${ports} ${ip}"
-            nmap -e ${iface} ${nmap_opt} -oX ${log_dir}/ndir/${log_ip}-tcp.xml -oG ${log_dir}/ndir/${log_ip}-tcp.grep -p ${ports} ${ip}
+        echo -e "${BLUE}[+]${RESET} ${UNICORNSCAN_BIN} -i ${iface} -mT -I -r${rate} ${ip}:1-65535"
+        "${UNICORNSCAN_BIN}" -i "${iface}" -mT -I -r"${rate}" "${ip}":1-65535 2>&1 \
+            | tee "${log_dir}/udir/${log_ip}-tcp.txt"
+        ports=$(grep -i "open" "${log_dir}/udir/${log_ip}-tcp.txt" \
+            | grep -oP '\[\K[0-9]+(?=\])' \
+            | sort -un \
+            | tr '\n' ',' \
+            | sed 's/,$//')
+        if [[ -n "${ports}" ]]; then
+            echo -e "${GREEN}[*]${RESET} TCP ports for nmap to scan: ${ports}"
+            echo -e "${BLUE}[+]${RESET} nmap -e ${iface} ${nmap_opt} -p ${ports} ${ip}"
+            nmap -e "${iface}" ${nmap_opt} \
+                -oX "${log_dir}/ndir/${log_ip}-tcp.xml" \
+                -oG "${log_dir}/ndir/${log_ip}-tcp.grep" \
+                -p "${ports}" "${ip}"
         else
             echo -e "${RED}[!]${RESET} No TCP ports found"
         fi
     fi
 
     # unicornscan identifies all open UDP ports
-    if [[ $proto == "udp" || $proto == "all" ]]; then  
+    if [[ "${proto}" == "udp" || "${proto}" == "all" ]]; then
         echo -e "${BLUE}[+]${RESET} Obtaining all open UDP ports using unicornscan..."
-        echo -e "${BLUE}[+]${RESET} unicornscan -i ${iface} -mU ${ip}:a -l ${log_dir}/udir/${log_ip}-udp.txt"
-        unicornscan -i ${iface} -mU ${ip}:a -l ${log_dir}/udir/${log_ip}-udp.txt
-        ports=$(cat "${log_dir}/udir/${log_ip}-udp.txt" | grep open | cut -d"[" -f2 | cut -d"]" -f1 | sed 's/ //g' | tr '\n' ',')
-        if [[ ! -z $ports ]]; then
-            # nmap follows up
-            echo -e "${GREEN}[*]${RESET} UDP ports for nmap to scan: $ports"
-            echo -e "${BLUE}[+]${RESET} nmap -e ${iface} ${nmap_opt} -sU -oX ${log_dir}/ndir/${log_ip}-udp.xml -oG ${log_dir}/ndir/${log_ip}-udp.grep -p ${ports} ${ip}"
-            nmap -e ${iface} ${nmap_opt} -sU -oX ${log_dir}/ndir/${log_ip}-udp.xml -oG ${log_dir}/ndir/${log_ip}-udp.grep -p ${ports} ${ip}
+        echo -e "${BLUE}[+]${RESET} ${UNICORNSCAN_BIN} -i ${iface} -mU -I -r${rate} ${ip}:1-65535"
+        "${UNICORNSCAN_BIN}" -i "${iface}" -mU -I -r"${rate}" "${ip}":1-65535 2>&1 \
+            | tee "${log_dir}/udir/${log_ip}-udp.txt"
+        ports=$(grep -i "open" "${log_dir}/udir/${log_ip}-udp.txt" \
+            | grep -oP '\[\K[0-9]+(?=\])' \
+            | sort -un \
+            | tr '\n' ',' \
+            | sed 's/,$//')
+        if [[ -n "${ports}" ]]; then
+            echo -e "${GREEN}[*]${RESET} UDP ports for nmap to scan: ${ports}"
+            echo -e "${BLUE}[+]${RESET} nmap -e ${iface} ${nmap_opt} -sU -p ${ports} ${ip}"
+            nmap -e "${iface}" ${nmap_opt} -sU \
+                -oX "${log_dir}/ndir/${log_ip}-udp.xml" \
+                -oG "${log_dir}/ndir/${log_ip}-udp.grep" \
+                -p "${ports}" "${ip}"
         else
             echo -e "${RED}[!]${RESET} No UDP ports found"
         fi
     fi
-done < ${targets}
+done < "${targets}"
 
 echo -e "${BLUE}[+]${RESET} Scans completed"
 echo -e "${BLUE}[+]${RESET} Results saved to ${log_dir}"
-
